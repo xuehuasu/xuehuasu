@@ -6,13 +6,25 @@
 
 # 参考资料
 
+计划表 [ 6.824 Schedule: Spring 2021 (mit.edu)](http://nil.csail.mit.edu/6.824/2021/schedule.html) 
+
 Go学习：[Go 语言之旅 (go-zh.org)](https://tour.go-zh.org/welcome/1) 
 
 资源： [chaozh/MIT-6.824: Basic Sources for MIT 6.824 Distributed Systems Class (github.com)](https://github.com/chaozh/MIT-6.824) 
 
 [MIT 6.824 2021 分布式系统 [中英文字幕\]_哔哩哔哩_bilibili](https://www.bilibili.com/video/BV16f4y1z7kn/) 
 
-mapreduce中文文档：[mapreduce论文翻译 - 知乎 (zhihu.com)](https://zhuanlan.zhihu.com/p/141657364) 
+中文文档仅供参考，翻译不好，重点地方**需要看[原文](http://nil.csail.mit.edu/6.824/2021/schedule.html)**，按照学习顺序添加
+
+[mapreduce论文翻译 - 知乎 (zhihu.com)](https://zhuanlan.zhihu.com/p/141657364) 
+
+ [Google File System](https://www.cnblogs.com/zzjhn/p/3834729.html) 
+
+ [The Design of a Practical System for Fault-Tolerant VirtualMachines ](https://zhuanlan.zhihu.com/p/539874472)  
+
+Raft-Extended没找到合适的翻译  [这篇文章](https://blog.csdn.net/Hedon954/article/details/119186225) 篡改了原文，有些地方误导性很大
+
+
 
 # mapreduce
 
@@ -187,8 +199,6 @@ reduce callMap会尝试连接三次，三次失败之后，暂时不通知master
 
 好好好，完结撒花！！！
 
-关于最后一个碰撞测试，如果刚好够倒霉(每次运行worker都会崩溃)的话，可能unix套接字直接会很快崩溃掉，如果将崩溃率上调到五十多，可能很容易就会出现套接字崩溃，不过现实中一套分布式系统产生50%多的崩溃，估计效率还不如单机了。
-
 
 
 最终的rpc通信协议：
@@ -282,3 +292,94 @@ type Maphost struct {
 第三个难点是容错机制的实现，论文提到：map失效必须重新执行，reduce不用，超时的任务选择重新分配
 
 寥寥三句话，花了我好几个小时实现，主要还是思路想半天，还有debug：超时使用定时器定期发布任务，仅仅是发布，只有等worker过来取的时候我才分配，master会根据当前进度选择不同的心跳时间，心跳时间一到，worker就会与master相连，此时如果有任务就直接分配，没有就下个心跳时间再来。如果map挂了，而此时又是reduce阶段的话，会阻塞所有reduce分配，直到map完成为止。
+
+
+
+# raft
+
+通过对lab1的实现，初步了解了分布式系统，和前几篇行为单一的论文不一样，raft论文描述的东西很多，很复杂，花了三四天才看完论文，每次都看着看着就没心思看下去了，一直在拖延，中文文档翻译的很一般，感觉像机翻，硬着头皮看完原文。感觉面对难以弄懂的知识，很有效的一个手段是反复学习，而不是从头懂到尾（过于理想的状态），初期看raft根本看不下去，多看几遍之后感觉很有意思。
+
+raft的复杂性远高于mapreduce，lab2被分为abcd四个小lab。 论文用一张表简要说明了大致的实现方向：
+
+![image-20231003205708748](picture/xuehuasu/raft.png)
+
+一些要点：
+
+1. 如何定义日志的“最新”，如果lastTerm不同，则数字越大的越新，如果lastTerm相同，则索引（日志长度）越大的越新，candidate不能投票给比自己“旧”的。
+
+2. leader不能提交往期的日志，只能通过提交当前任期日志，间接提交往期的日志。
+
+3. 安全性通过以上两点保证，但不完全只有以上两点
+
+![image-20231004094837640](picture/xuehuasu/raft-installSnapShot.png)
+
+## raft 2a
+
+2a主要是leader选举方面的实现
+
+万事开头难放在任何时候都是这样的，拿到代码框架完全不知道从哪里入手。。。磨蹭半天根据图2写了一些结构体，做了下初始化。
+
+虽然2a只检查领导选举，但是又不能只写选举，选举机制建立在日志的新旧程度上，那么要先把日志相关的写了，这个过程遇到很烦人的问题，日志这个东西不管在哪里都掺和了一脚，导致只要有一个地方出现纰漏都要改很多个相似的代码，于是决定把日志抽象成类，给它定义一些管理方法。
+
+```go
+type Entry struct {
+	Term    int
+	Command interface{}
+}
+
+type Log struct {
+	Entries []Entry
+	index0  int // 日志起始下标，压缩日志时使用，默认为0
+}
+
+func (log *Log) endIndex() int {
+	return log.index0 + len(log.Entries)
+}
+
+func (log *Log) beginIndex() int {
+	return log.index0
+}
+
+func (log *Log) lastTerm() int {
+	if len(log.Entries) == 0 {
+		return -1
+	}
+	return log.Entries[len(log.Entries)-1].Term
+}
+
+func (log *Log) append(entry Entry) {
+	log.Entries = append(log.Entries, entry)
+}
+
+func (log *Log) get(index int) Entry {
+	return log.Entries[index-log.index0]
+}
+
+```
+
+目前来说就这些，随着功能的增加还会不断完善，抽象出来后主体代码简洁多了
+
+![image-20231005211821985](picture/xuehuasu/raft2a.png)
+
+中间出了一个bug，产生原因是reply参数被多个线程共享了，一开始没有注意，gob的警告一直被我忽略(一直以为是其它地方造成的，在寻找逻辑bug)，直到我重视gob警告说对象可能无效，才发现这个问题。所以warning不是没有道理的(捂脸)。
+
+
+
+## raft 2b
+
+2b主要实现日志的复制，Start 和 AppendEntries，大部分的代码2a已经实现了，在这个基础上改一改就能通过（希望如此）
+
+日志索引从0开始的话会出现下标为-1之类的边界情况，特判起来很麻烦，不仅需要考虑下限还要考虑上限，容易引起bug，从1开始比较好，此时就体现出2a中抽象出log的优势了，我只要改一下初始化和个别方法就可以了。
+
+同样的，任期也改为从1开始，可以避免很多麻烦。
+
+debug:
+
+1.日志无限输出，陷入了死循环，排查后发现是**死锁**，是ticker函数占用锁，而负责发送心跳的函数也申请了锁导致的问题，解决办法是冗余函数代码，对有锁和无锁分别写一个实现，并加上后缀L进行区别，有L表示i调用方有锁，无需申请，没有L则需要主动申请。这个bug2a的时候应该就存在，但是没有测试出来。
+
+题外话：现在打日志是越来越熟练了，把可能要的信息尽可能详细的全部打印出来，然后使用搜索工具检索关键字就好了，日志信息最好包含时间戳，对象唯一标识，和一定的提示信息，现在想想以前的调试真像原始人，打日志一定不要偷懒，日志信息越少调试越困难。了解到更高级的方法是对日志进行解析，分颜色显示，甚至是分列显示，不过目前还没做到这步。
+
+2.有一个问题是follower在复制完上一条日志前，又收到了新的同步，导致一直在同步，多出了很多rpc请求，这里的策略的是失败立即重试，可能是这个策略的缘故，那么我就改为失败后等待下一个心跳同步。
+
+3.八个点过了六个，失败的测试点：cmd 100 missing in [1 101 101 104 104] ` 猜测是复制日志的时候有细节没处理得当。检查了一下发现日志全部都完整的提交了，主从都提交了完整的日志上去。有点奇怪，我得看看测试程序到底要求我干什么
+
