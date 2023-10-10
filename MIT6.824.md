@@ -103,11 +103,7 @@ for ... {
 
 于是，终于得到了一个能输出的分布式框架（bushi)
 
-
-
 接下来是容错的计划，论文上提过我们的程序必须容忍错误，比如map就算执行完毕，只要宕机那么它的任务需要重新执行，reduce宕机则不用，因为reduce执行完毕后，存储在全局文件系统。还有当个别任务迟迟等不到回复的时候，需要重新分配任务，此时不管是因为worker主机宕机，还是执行速度慢，都重新分配。论文似乎没有说到有心跳检测机制，那我也不实现了，所有回复慢的一律再分配。
-
-
 
 改着改着，突然又跑不了了，而且出现了贼抽象的bug
 
@@ -389,5 +385,96 @@ debug:
 
 万万没想到居然是Start的问题：leader添加日志的时候，因为要求Start立即返回，所以我开了一个线程去添加日志，而问题就出在这里，并发条件下，`endIndex`并不会像想象中那样及时更新，所以要添加完日志后，再返回（本来是理所当然的一件事，但是由于一开始的时候对流程不够熟悉，后面又把这里忘了）
 
-![image-20231007163448756](picture/xuehuasu/raft2b.png)
+ 多测试几次后，发现会出概率bug（卒）
+
+为了方便测试，我直接写了一个脚本，运行命令： ` ./test_loop.sh 2B`
+
+```cpp
+#!/bin/bash  
+
+FLAG=false
+total_time=0
+result() {  
+    if [[ ${FLAG} == true ]]; then
+        echo "FAIL"
+    else
+        echo "PASS ALL " ${i}
+    fi
+    echo "time: ${total_time}s"
+    exit 1
+}  
+trap result SIGINT 
+
+test=$1
+i=1
+for ((; i<=10000; i++))  
+do  
+    s_time=$(date +%s)
+    echo "Running test${test} iteration $i..."  
+    go test -run ${test} -race > out/output${i}.log &
+    wait # 等待上一个命令结束 
+    e_time=$(date +%s)
+    run_time=$((e_time - s_time))
+    total_time=$((total_time + run_time))
+
+    # 检查日志最后一行的第一个单词是否为 "FAIL"
+    last_line=$(tail -n 1 out/output${i}.log)
+    first_word=$(echo "$last_line" | awk '{print $1}')
+    if [[ "$first_word" == "FAIL" ]]; then
+        FLAG=true
+        echo "---FAIL "${i}" time: ${run_time}s"
+    else
+        echo "PASS "${i}" time: ${run_time}s"
+        rm -rf out/output${i}.log
+    fi
+done
+
+
+if [[ ${FLAG} == true ]]; then
+    echo "FAIL"
+else
+    echo "PASS ALL "${i}
+fi
+echo "time: ${total_time}s"
+```
+
+分析日志我发现选举过程有概率split-brain（脑裂），同一任期出现两个leader。居然有人投出去两票！！！怎么会这样。
+
+发现问题在于每次非leader更新日志的时候，把状态切成Follower的同时还会把Vote置为-1。并发条件下有些落后的信息就钻空子了。
+
+![image-20231008142229031](picture/xuehuasu/raft2b-testloop.png)
+
+## raft 2c
+
+2c要求对状态持久化，实现persist和readPersist，同时使用gob对数据压缩。需要持久化的字段应该是raft图2描述的state
+
+运行了25次，8次FAIL，70%能通过至少说明persist没问
+
+2C的数据量很大，按照2B的调试精度直接搞出八万行，每行上百个字段，根本调不了
+
+debug:
+
+日志很混乱，下标相同的log，内容完全不一样，还有的server日志差了几个版本，根本就是一团乱麻。
+
+日志梳理插件`logFileHighlighter`,只需要像下面这样简单配置，log文件的相应内容就能高亮显示，支持正则表达式。想让谁亮，就让谁亮。
+
+![image-20231008192125771](picture/xuehuasu/log_tool.png)
+
+2C的环境是模拟网络很差以及服务器不定期下线，要求我通过持久化来解决这些“非人为”导致的错误。
+
+日志中0号服务器不是leader，但是却出现了0号发送的同步消息，虽然它没有成功同步，但是十分诡异的是它发送的消息中包含的任期号比它自身大一些。到底是哪里调用了发送函数，还有发送的任期号怎么会比自身还高？不只是2C中，2B中也有这种行为，有完全不属于当前进度的任期号出现，根据输出的日志可以断定心跳函数被奇怪的东西调用了，而且还发生了未定义行为(比如不属于自身的高任期)。再仔细看，有时候就连主机号都是不存在的，但是数值又比较小（只比正常的id大1或2），一开始根本没注意这个，那么现在rpc失败成了理所当然，我一开始还认为是测试程序随机让我失败。这下范围就缩减很多了，肯定是发送同步心跳那块出的问题，发送方不知道在乱发什么东西。
+
+检查一遍之后更奇怪了，从准备到同步心跳的过程就那么几个函数，能发送心跳的只有两个途径，这两个途径全程上锁，不可能被奇怪的东西影响和调用，我懵了。
+
+`sendMsg: args: {2 2 1 2 [{2 102} {2 103} {2 104}] 1} to 0 failed myId: 2 currentTerm: 6 votedFor: 0`
+
+args参数是2，当前任期号已经是6了，这个args是很远之前的消息了吧。
+
+实在是受不了了，回退到2B提交那个版本，经过多次测试这个版本的2B没有问题。那么就是2C这里弄错了东西(至于搞混了什么真的捋不清了，还好可以有版本回退)，调试的时候不出bug比我出bug还难受
+
+终于找到原因了，原本的超时选举时间是150~300ms，心跳时间间隔是50ms，导致只要消息阻塞一会或者失败一下，新的选举就开始了，然后就是leader发出去的消息没人鸟，新leader上任后又没有日志，消息与消息之间发送的太频繁了，我将超时时间改为300~550ms，并且拒绝所有过期的消息，终于再没看到问题。
+
+![image-20231010123912538](picture/xuehuasu/raft2c.png)
+
+测试了34次全部通过，平均每次时间140ms左右，在正常范围内。
 
