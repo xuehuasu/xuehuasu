@@ -404,38 +404,40 @@ result() {
     exit 1
 }  
 trap result SIGINT 
+  
+if [ -z "$1" ]; then  
+    echo "第一个参数为空"  
+    exit 1
+fi
 
 test=$1
 i=1
-for ((; i<=10000; i++))  
+for ((; i<=3000; i++))  
 do  
     s_time=$(date +%s)
-    echo "Running test${test} iteration $i..."  
-    go test -run ${test} -race > out/output${i}.log &
+    echo "Running test ${test} iteration $i..."  
+    filename="out/${test}output${i}.log"
+    
+    go test -run ${test} > ${filename} &
     wait # 等待上一个命令结束 
     e_time=$(date +%s)
     run_time=$((e_time - s_time))
     total_time=$((total_time + run_time))
 
     # 检查日志最后一行的第一个单词是否为 "FAIL"
-    last_line=$(tail -n 1 out/output${i}.log)
+    last_line=$(tail -n 1 ${filename})
     first_word=$(echo "$last_line" | awk '{print $1}')
-    if [[ "$first_word" == "FAIL" ]]; then
+    second_word=$(echo "$last_line" | awk '{print $2}')
+    if [[ "$first_word" == "FAIL" || second_word == "FAIL" ]]; then
         FLAG=true
-        echo "---FAIL "${i}" time: ${run_time}s"
+        echo "--- FAIL "${i}" time: ${run_time}s"
     else
         echo "PASS "${i}" time: ${run_time}s"
-        rm -rf out/output${i}.log
+        rm -rf ${filename}
     fi
 done
 
-
-if [[ ${FLAG} == true ]]; then
-    echo "FAIL"
-else
-    echo "PASS ALL "${i}
-fi
-echo "time: ${total_time}s"
+result()
 ```
 
 分析日志我发现选举过程有概率split-brain（脑裂），同一任期出现两个leader。居然有人投出去两票！！！怎么会这样。
@@ -472,9 +474,20 @@ args参数是2，当前任期号已经是6了，这个args是很远之前的消�
 
 实在是受不了了，回退到2B提交那个版本，经过多次测试这个版本的2B没有问题。那么就是2C这里弄错了东西(至于搞混了什么真的捋不清了，还好可以有版本回退)，调试的时候不出bug比我出bug还难受
 
-终于找到原因了，原本的超时选举时间是150~300ms，心跳时间间隔是50ms，导致只要消息阻塞一会或者失败一下，新的选举就开始了，然后就是leader发出去的消息没人鸟，新leader上任后又没有日志，消息与消息之间发送的太频繁了，我将超时时间改为300~550ms，并且拒绝所有过期的消息，终于再没看到问题。
+原因似乎是：原本的超时选举时间是150\~300ms，心跳时间间隔是50ms，导致只要消息阻塞一会或者失败一下极端一些的情况下，leader正常工作，新的选举却开始了，leader发出去的消息没人鸟(被认为是过期)，而新leader上任后又没有日志，导致服务频繁的不可用，消息与消息之间间隔太短，我将超时时间改为300\~550ms，并且拒绝所有过期的消息(一开始考虑到任期都是递增的，即使有过期也会被接收方拒绝，但没想到的是发送方也无法处理自己的过期消息，导致就出现了很多复杂的纠缠)，修改完这些bug，终于再没看到问题。
 
 ![image-20231010123912538](picture/xuehuasu/raft2c.png)
 
-测试了34次全部通过，平均每次时间140ms左右，在正常范围内。
+测试了34次全部通过，平均每次140s左右，在正常范围内。
 
+> 一次面试中，面试官问我为什么对调试命令不太熟，我说我一般在vscode里面`ctrl + f`看日志，然后被嘲笑了......他说正经程序员还是用终端。
+
+
+
+## raft2d
+
+终于到这一步了，这里的难度看起来不小于前面任何一个，如果前面的基础够牢固的话会简单很多(即使我测试了很多遍，我也不敢保证真的没有错误)，2d主要要求对日志进行压缩，通过快照将服务器快速重启。
+
+除了2d必须要添加的快照操作函数、接口、变量之外，在原来基础上只需要修改`AppendEntry`和`sendMsg`就够了(确信)，需要修改的两个函数涉及心跳同步机制，之前同步没有考虑快照，现在可能需要考虑发送快照给对方同步。
+
+我将快照设置为每10秒创建一次，如果10秒内状态并没有改变，就取消本次创建，判断是否创建快照取决于`lastApplied`是否有更新，只有已提交的日志才能安全的创建快照。
