@@ -546,11 +546,9 @@ leader 2收到新日志，下标为109，同步并提交，测试文件输出：
 
 ![image-20231014235200003](picture/xuehuasu/raft2d.png)
 
+测试全部： `time go test -race` 
 
-
-`time go test -race` 
-
-![image-20231015101437977](picture/xuehuasu/raft-runtime.png)
+![image-20231015235447278](picture/xuehuasu/raft-runtime.png)
 
 
 
