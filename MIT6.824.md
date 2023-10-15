@@ -550,7 +550,7 @@ leader 2收到新日志，下标为109，同步并提交，测试文件输出：
 
 `time go test -race` 
 
-![](picture/xuehuasu/raft-runtime.png)
+![image-20231015101437977](picture/xuehuasu/raft-runtime.png)
 
 
 
