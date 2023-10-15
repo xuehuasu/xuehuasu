@@ -38,15 +38,19 @@ Raft-Extended没找到合适的翻译  [这篇文章](https://blog.csdn.net/Hedo
 
 # mapreduce
 
-这个框架用于处理大规模数据集的并行计算任务。具有良好的可扩展性、易用性和容错性，并适用于各种应用场景。
+这个框架用于处理大规模数据集的并行计算任务。具有良好的可扩展性、易用性和容错性，并适用于各种应用场景。比如日志分析，分布式grep，为推荐系统和机器学习提供一定程度的底层支持。
 
-**可扩展性**：通过添加更多的计算节点，可以实现更高的并行度和更快的计算速度。
+**可扩展性**：能很轻易的添加更多的计算节点，可以实现更高的并行度和更快的计算速度。
 
 **易用性**：提供简单易用的接口和编程模型，使开发人员能够方便地编写和执行 MapReduce 任务。隐藏了底层的分布式计算细节，让用户专注于业务逻辑的实现。
 
 **容错性**：容错机制，能够处理计算节点的故障和数据丢失，自动重新分配任务和恢复中断的计算过程，并没有实现master容错。
 
 master负责接收任务，分配任务，和返回结果集给用户，map worker负责将数据分片进一步划分为更小的数据块，处理输入数据并生成中间键值对，reduce worker负责将相同键的值进行聚合、合并、计算等操作，用户定义的map和reduce函数决定最终生成的结果。
+
+任务分配策略是worker主动发起心跳请求，如果有任务则进行分配，程序完全模拟分布式下的情况：使用rpc通信，地址为ip+端口号，两种worker之间信息完全隔离，只能通过master交互信息。
+
+mapreduce最大的特点是所有操作幂等性，不论什么任务都可以重复执行，而不会出错。
 
 # raft
 
@@ -333,6 +337,8 @@ raft的复杂性远高于mapreduce，lab2被分为abcd四个小lab。 论文用�
 
 2. leader不能提交往期的日志，只能通过提交当前任期日志，间接提交往期的日志。
 
+   ![image-20231013223537152](picture/xuehuasu/raft-figure8.png)
+
 3. 安全性通过以上两点保证，但不完全只有以上两点
 
 ![image-20231004094837640](picture/xuehuasu/raft-installSnapShot.png)
@@ -502,7 +508,7 @@ args参数是2，当前任期号已经是6了，这个args是很远之前的消�
 
 实在是受不了了，回退到2B提交那个版本，经过多次测试这个版本的2B没有问题。那么就是2C这里弄错了东西(至于搞混了什么真的捋不清了，还好可以有版本回退)，调试的时候不出bug比我出bug还难受
 
-原因似乎是：原本的超时选举时间是150\~300ms，心跳时间间隔是50ms，导致只要消息阻塞一会或者失败一下极端一些的情况下，leader正常工作，新的选举却开始了，leader发出去的消息没人鸟(被认为是过期)，而新leader上任后又没有日志，导致服务频繁的不可用，消息与消息之间间隔太短，我将超时时间改为300\~550ms，并且拒绝所有过期的消息(一开始考虑到任期都是递增的，即使有过期也会被接收方拒绝，但没想到的是发送方也无法处理自己的过期消息，导致就出现了很多复杂的纠缠)，修改完这些bug，终于再没看到问题。
+原因是：leader收到往期发送的日志的回复，没有做检验，导致数据混乱了，我添加了校验，并且将超时选举时间增加了50ms，避免选举次数过多。
 
 ![image-20231010123912538](picture/xuehuasu/raft2c.png)
 
@@ -518,3 +524,82 @@ args参数是2，当前任期号已经是6了，这个args是很远之前的消�
 
 除了2d必须要添加的快照操作函数、接口、变量之外，在原来基础上只需要修改`AppendEntry`和`sendMsg`就够了(确信)，需要修改的两个函数涉及心跳同步机制，之前同步没有考虑快照，现在可能需要考虑发送快照给对方同步。
 
+考虑了很久怎么实现快照的存储和读取，结果读文档发现已经提供好了接口，我只用把结果提交给接口就行了(流汗.jpg)
+
+debug:
+
+1.故事的场景是这样的：leader添加当前日志后，死机，然后立马恢复，开始重新选举，并且成功当选，于是当前leader拥有最新的、尚未同步的、尚未提交的日志，leader通过心跳同步，把这个往期日志同步给follower，然后新的日志到来，leader同步并提交这个日志，同时往期日志也会被顺利提交，一切都很正常，但是不和谐的bug出现了：
+
+leader 2死机前： 测试文件收到并输出： server 1 apply 107 lastApplied 106
+
+leader 2收到新日志，下标为108，然后马上死机重启，重新当选
+
+leader 2收到新日志，下标为109，同步并提交，测试文件输出：server 1 apply 108 lastApplied 99
+
+上面这一段的bug是 server 1作为follower，提交了107之前的所有日志，然后新leader上任后，100~107之间的似乎就白提交了。
+
+我突然看到上层调用了`CondInstallSnapshot`函数，让两个follower切换了快照，截断了99之前的日志，终于发现bug起因了：server 0切换快照后重新提交了99~107的日志，但是server 1并没有重新提交，明明是同一份代码，为什么会有这种差错？？？不过bug位置找到了，之后就好解决了。
+
+破案了，我傻逼的把`CondInstallSnapshot`全部返回了true，导致原本没有切换，上层却以为切换了快照。
+
+2.小bug，新增的快照功能没有维护leader的唯一性，导致分裂了。检查一下快照相关函数就解决了。多线程下我们无法确认函数执行顺序，包括rpc函数，所以要在每次发送前检查自己是否还是leader，**或者**开启线程发送之前就先定义好参数，确保发送的数据一定是确定的状态。在rpc调用前后，有可能发生状态转变，所以也要做参数校验(代码中其实就是检查任期)，这个问题在日志同步和领导选举中也是一样的。
+
+![image-20231014235200003](picture/xuehuasu/raft2d.png)
+
+
+
+`time go test -race` 
+
+![](picture/xuehuasu/raft-runtime.png)
+
+
+
+最终结构：(rpc通信字段是按照figure 2 和 13设计的，就不展示了)
+
+```go
+type Raft struct {
+        mu        sync.Mutex
+        cond      *sync.Cond
+        peers     []*labrpc.ClientEnd // 所有的RPC端点
+        persister *Persister          // Object to hold this peer's persisted state 持久化状态
+        me        int                 // 当前节点在peers中的索引
+        dead      int32               // 用于标记当前节点是否已经被关闭
+
+        applyCh   chan ApplyMsg
+        applyCond *sync.Cond
+
+        state        int       // 当前节点的状态
+        electiontime time.Time // 选举超时时间
+
+        currentTerm int // 当前任期
+        votedFor    int // 当前任期投票给谁了
+        log         Log // 日志
+
+        commitIndex int // 已经提交的日志索引
+        lastApplied int // 已经应用的日志索引
+
+        nextIndex  []int // 每个节点的日志索引
+        matchIndex []int // 每个节点已经复制的日志索引
+
+        snapshot          []byte
+        lastIncludedIndex int
+        lastIncludedTerm  int
+}
+
+type Entry struct {
+        Term    int
+        Command interface{}
+}
+
+type Log struct {
+        Entries []Entry
+        Index0  int
+}
+
+```
+
+
+
+# kv-raft
+
+这一阶段，是利用raft提供键值服务。
