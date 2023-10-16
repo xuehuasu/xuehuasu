@@ -548,9 +548,11 @@ leader 2收到新日志，下标为109，同步并提交，测试文件输出：
 
 测试全部： `time go test -race` 
 
-![image-20231015235447278](picture/xuehuasu/raft-runtime.png)
+![image-20231016205517053](picture/xuehuasu/raft-runtime.png)
 
+测试了一天：
 
+![image-20231016204709825](picture/xuehuasu/raft-looptest.png)
 
 最终结构：(rpc通信字段是按照figure 2 和 13设计的，就不展示了)
 
