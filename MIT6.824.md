@@ -22,9 +22,9 @@ Go学习：[Go 语言之旅 (go-zh.org)](https://tour.go-zh.org/welcome/1)
 
  [The Design of a Practical System for Fault-Tolerant VirtualMachines ](https://zhuanlan.zhihu.com/p/539874472)  
 
-Raft-Extended没找到合适的翻译  [这篇文章](https://blog.csdn.net/Hedon954/article/details/119186225) 篡改了原文，有些地方误导性很大
+Raft-Extended 没找到合适的翻译  [这篇文章](https://blog.csdn.net/Hedon954/article/details/119186225) 篡改了原文，有些地方误导性很大
 
-
+zookeeper  没有合适的译文
 
 # Go
 
